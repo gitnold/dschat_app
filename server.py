@@ -17,7 +17,7 @@ def accept(server_sock):
 
     conn.sendall(f"__system__ Your ID: {client_id}\n".encode())
     broadcast(f"System: User {client_id} joined (total: {len(clients)})")
-    broadcast_clients_count()
+    broadcast_user_list()
 
 
 def handle_client(conn):
@@ -28,19 +28,62 @@ def handle_client(conn):
                 line = line.strip()
                 if not line:
                     continue
-                client_id = clients[conn.fileno()]["id"]
-                broadcast(f"User {client_id}: {line}")
+                client_info = clients.get(conn.fileno())
+                if not client_info:
+                    continue
+                client_id = client_info["id"]
+
+                parts = line.split(maxsplit=2)
+                if len(parts) >= 3 and parts[0] == "/msg":
+                    try:
+                        target_id = int(parts[1])
+                        message = parts[2]
+                    except ValueError:
+                        continue
+                    send_private(client_id, target_id, message)
+                else:
+                    broadcast(f"User {client_id}: {line}")
         else:
             remove_client(conn)
     except Exception:
         remove_client(conn)
 
 
-def broadcast(msg, exclude=None):
+def send_private(from_id, to_id, message):
+    sender_info = None
+    recipient_info = None
+    for info in clients.values():
+        if info["id"] == from_id:
+            sender_info = info
+        if info["id"] == to_id:
+            recipient_info = info
+
+    if not recipient_info:
+        if sender_info:
+            try:
+                sender_info["conn"].sendall(
+                    f"__system__ User {to_id} is not online\n".encode()
+                )
+            except Exception:
+                pass
+        return
+
+    msg = f"__private__ from {from_id} to {to_id}: {message}"
+
+    try:
+        recipient_info["conn"].sendall((msg + "\n").encode())
+    except Exception:
+        remove_client(recipient_info["conn"])
+
+    try:
+        sender_info["conn"].sendall((msg + "\n").encode())
+    except Exception:
+        remove_client(sender_info["conn"])
+
+
+def broadcast(msg):
     disconnected = []
     for fd, info in list(clients.items()):
-        if exclude is not None and info["conn"] == exclude:
-            continue
         try:
             info["conn"].sendall((msg + "\n").encode())
         except Exception:
@@ -50,11 +93,12 @@ def broadcast(msg, exclude=None):
             remove_client(clients[fd]["conn"])
 
 
-def broadcast_clients_count():
-    count = len(clients)
+def broadcast_user_list():
+    user_ids = [str(info["id"]) for info in clients.values()]
+    msg = f"__system__ USERLIST:{','.join(user_ids)}"
     for info in clients.values():
         try:
-            info["conn"].sendall(f"__system__ CLIENTS:{count}\n".encode())
+            info["conn"].sendall((msg + "\n").encode())
         except Exception:
             pass
 
@@ -71,7 +115,7 @@ def remove_client(conn):
         except Exception:
             pass
         broadcast(f"System: User {info['id']} left (total: {len(clients)})")
-        broadcast_clients_count()
+        broadcast_user_list()
 
 
 def run_server(host="127.0.0.1", port=65432):
