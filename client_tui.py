@@ -105,6 +105,8 @@ class ChatTUI(App):
         self._connected = False
         self.my_id = None
         self._connecting = False
+        self._shutdown = False
+        self._listen_task = None
         self.messages = []
         self.current_chat = "all"
         self.online_users = set()
@@ -133,7 +135,11 @@ class ChatTUI(App):
         yield Footer()
 
     def on_mount(self):
+        self._shutdown = False
         asyncio.create_task(self.connect())
+
+    def on_unmount(self):
+        self._shutdown = True
 
     async def connect(self):
         if self._connecting:
@@ -148,7 +154,7 @@ class ChatTUI(App):
             self.log_message("[bold green]Connected to server[/bold green]")
             self.query_one("#msg_input", Input).disabled = False
             self.query_one("#msg_input", Input).focus()
-            asyncio.create_task(self.listen())
+            self._listen_task = asyncio.create_task(self.listen())
 
         except (ConnectionRefusedError, OSError) as e:
             self._connected = False
@@ -157,6 +163,8 @@ class ChatTUI(App):
             self.log_message(f"[red]Connection failed: {e}[/red]")
             self.query_one("#msg_input", Input).disabled = True
             self.query_one("#client_count", Static).update("")
+            if self._shutdown:
+                return
             await asyncio.sleep(5)
             asyncio.create_task(self.connect())
 
@@ -175,7 +183,7 @@ class ChatTUI(App):
                     self.handle_broadcast(msg)
         
         except asyncio.CancelledError:
-            pass
+            return
 
         except Exception as e:
             self.log_message(f"[red]Connection lost: {e}[/red]")
@@ -183,13 +191,18 @@ class ChatTUI(App):
         finally:
             self._connected = False
             self.set_connection_status(False)
-            self.query_one("#msg_input", Input).disabled = True
+            try:
+                self.query_one("#msg_input", Input).disabled = True
+            except Exception:
+                pass
             if self.writer:
                 try:
                     self.writer.close()
                     await self.writer.wait_closed()
                 except Exception:
                     pass
+            if self._shutdown:
+                return
             if not self._connecting:
                 self.messages.clear()
                 self.current_chat = "all"
@@ -261,14 +274,20 @@ class ChatTUI(App):
             self.query_one("#chat_log", RichLog).write(formatted)
 
     def set_connection_status(self, connected):
-        static = self.query_one("#server_status", Static)
+        try:
+            static = self.query_one("#server_status", Static)
+        except Exception:
+            return
         if connected:
             static.update("[green]\u25cf Server: Connected[/green]")
         else:
             static.update("[red]\u25cf Server: Disconnected[/red]")
 
     def log_message(self, msg):
-        self.query_one("#chat_log", RichLog).write(msg)
+        try:
+            self.query_one("#chat_log", RichLog).write(msg)
+        except Exception:
+            pass
 
     def on_button_pressed(self, event):
         bid = event.button.id
@@ -365,6 +384,9 @@ class ChatTUI(App):
                 child.variant = "primary" if uid == self.current_chat else "default"
 
     def action_quit(self):
+        self._shutdown = True
+        if self._listen_task and not self._listen_task.done():
+            self._listen_task.cancel()
         if self.writer:
             try:
                 self.writer.close()
