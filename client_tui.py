@@ -1,5 +1,10 @@
 import asyncio
+import base64
 import re
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Header, Footer, Input, RichLog, Static, Button
@@ -110,6 +115,44 @@ class ChatTUI(App):
         self.messages = []
         self.current_chat = "all"
         self.online_users = set()
+        self._key_sent = False
+
+        self.private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+        )
+        pubkey_pem = self.private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        self.pubkey_b64 = base64.b64encode(pubkey_pem).decode()
+        self.peer_public_keys = {}
+
+    def encrypt_text(self, pubkey, plaintext):
+        ciphertext = pubkey.encrypt(
+            plaintext.encode(),
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+        return base64.b64encode(ciphertext).decode()
+
+    def decrypt_text(self, encrypted_b64):
+        try:
+            ciphertext = base64.b64decode(encrypted_b64)
+            plaintext = self.private_key.decrypt(
+                ciphertext,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None,
+                ),
+            )
+            return plaintext.decode()
+        except Exception:
+            return None
 
     def compose(self):
         yield Header(show_clock=True)
@@ -121,7 +164,7 @@ class ChatTUI(App):
         with Horizontal(id="main_container"):
             with Vertical(id="sidebar"):
                 yield Button("All", id="user_all", variant="primary", classes="sidebar-btn")
-                yield Static("── Online ──", id="sidebar_divider")
+                yield Static("-- Online --", id="sidebar_divider")
 
             with Vertical(id="chat_area"):
                 yield Static("Chat: All", id="chat_header")
@@ -145,6 +188,7 @@ class ChatTUI(App):
         if self._connecting:
             return
         self._connecting = True
+        self._key_sent = False
         self.log_message(f"[yellow]Connecting to {self.host}:{self.port}...[/yellow]")
         try:
             self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
@@ -168,6 +212,12 @@ class ChatTUI(App):
             await asyncio.sleep(5)
             asyncio.create_task(self.connect())
 
+    def send_key(self):
+        if self.writer and not self._key_sent:
+            self.writer.write((f"__key__ {self.pubkey_b64}\n").encode())
+            asyncio.create_task(self.writer.drain())
+            self._key_sent = True
+
     async def listen(self):
         try:
             while True:
@@ -179,49 +229,64 @@ class ChatTUI(App):
                     self.handle_system_message(msg)
                 elif msg.startswith("__private__"):
                     self.handle_private_message(msg)
+                elif msg.startswith("__key__"):
+                    self.handle_key_message(msg)
                 else:
                     self.handle_broadcast(msg)
-        
+
         except asyncio.CancelledError:
             return
 
         except Exception as e:
             self.log_message(f"[red]Connection lost: {e}[/red]")
 
-        finally:
-            self._connected = False
-            self.set_connection_status(False)
+        self._connected = False
+        self.set_connection_status(False)
+        try:
+            self.query_one("#msg_input", Input).disabled = True
+        except Exception:
+            pass
+        if self.writer:
             try:
-                self.query_one("#msg_input", Input).disabled = True
+                self.writer.close()
+                await self.writer.wait_closed()
             except Exception:
                 pass
-            if self.writer:
-                try:
-                    self.writer.close()
-                    await self.writer.wait_closed()
-                except Exception:
-                    pass
-            if self._shutdown:
-                return
-            if not self._connecting:
-                self.messages.clear()
-                self.current_chat = "all"
-                self.online_users.clear()
-                self.update_sidebar()
-                self.update_chat_header()
-                asyncio.create_task(self.connect())
+        if not self._shutdown and not self._connecting:
+            self.messages.clear()
+            self.current_chat = "all"
+            self.online_users.clear()
+            self.peer_public_keys.clear()
+            self._key_sent = False
+            self.update_sidebar()
+            self.update_chat_header()
+            asyncio.create_task(self.connect())
 
     def handle_system_message(self, msg):
         content = msg[len("__system__"):].strip()
         if content.startswith("Your ID:"):
             self.my_id = content.split(":")[1].strip()
             self.log_message(f"[bold cyan]You are User {self.my_id}[/bold cyan]")
+            self.send_key()
         elif content.startswith("USERLIST:"):
             ids_str = content.split(":", 1)[1].strip()
             self.online_users = set(ids_str.split(",")) if ids_str else set()
             self.update_sidebar()
         elif content.startswith("User ") and "is not online" in content:
             self.log_message(f"[red]{content}[/red]")
+
+    def handle_key_message(self, msg):
+        rest = msg[len("__key__"):].strip()
+        match = re.match(r'^from\s+(\d+):\s*(.*)', rest)
+        if match:
+            user_id = match.group(1)
+            pubkey_b64 = match.group(2)
+            try:
+                pubkey_pem = base64.b64decode(pubkey_b64)
+                pubkey = load_pem_public_key(pubkey_pem)
+                self.peer_public_keys[user_id] = pubkey
+            except Exception:
+                pass
 
     def handle_broadcast(self, msg):
         match = re.match(r'^User\s+(\d+):\s*(.*)', msg)
@@ -254,13 +319,19 @@ class ChatTUI(App):
         text = match.group(3)
 
         if from_id == self.my_id:
-            formatted = f"[bold cyan]You -> User {to_id}: {text}[/bold cyan]"
-            chat_partner = to_id
-        elif to_id == self.my_id:
-            formatted = f"[bold yellow]User {from_id} (private): {text}[/bold yellow]"
-            chat_partner = from_id
-        else:
             return
+
+        display_text = text
+        if text.startswith("__enc__"):
+            encrypted_b64 = text[len("__enc__"):]
+            decrypted = self.decrypt_text(encrypted_b64)
+            if decrypted is not None:
+                display_text = decrypted
+            else:
+                display_text = "[red][decryption failed][/red]"
+
+        formatted = f"[bold yellow]User {from_id} (private): {display_text}[/bold yellow]"
+        chat_partner = from_id
 
         entry = {
             "type": "private",
@@ -314,10 +385,29 @@ class ChatTUI(App):
 
         if self.current_chat == "all":
             self.writer.write((msg + "\n").encode())
+            asyncio.create_task(self.writer.drain())
+            return
+
+        recipient_id = self.current_chat
+        pubkey = self.peer_public_keys.get(recipient_id)
+
+        if pubkey:
+            encrypted = self.encrypt_text(pubkey, msg)
+            self.writer.write((f"/msg {recipient_id} __enc__{encrypted}\n").encode())
         else:
-            self.writer.write((f"/msg {self.current_chat} {msg}\n").encode())
+            self.writer.write((f"/msg {recipient_id} {msg}\n").encode())
 
         asyncio.create_task(self.writer.drain())
+
+        formatted = f"[bold cyan]You -> User {recipient_id}: {msg}[/bold cyan]"
+        self.messages.append({
+            "type": "private",
+            "from_id": self.my_id,
+            "to_id": recipient_id,
+            "formatted": formatted,
+        })
+        if self.current_chat == recipient_id:
+            self.query_one("#chat_log", RichLog).write(formatted)
 
     def switch_chat(self, target):
         if target == self.current_chat:
@@ -335,7 +425,7 @@ class ChatTUI(App):
         if self.current_chat == "all":
             header.update("Chat: All")
         else:
-            header.update(f"Chat: User {self.current_chat} (private)")
+            header.update(f"\U0001f512 Chat: User {self.current_chat} (private) \u00b7 End-to-end encrypted")
 
     def update_input_placeholder(self):
         inp = self.query_one("#msg_input", Input)
@@ -347,6 +437,8 @@ class ChatTUI(App):
     def rebuild_chat_log(self):
         chat_log = self.query_one("#chat_log", RichLog)
         chat_log.clear()
+        if self.current_chat != "all":
+            chat_log.write("[bold green]\U0001f512 Messages are end-to-end encrypted[/bold green]")
         for entry in self.messages:
             if self.current_chat == "all":
                 if entry["type"] == "broadcast":

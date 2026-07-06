@@ -41,6 +41,8 @@ def handle_client(conn):
                     except ValueError:
                         continue
                     send_private(client_id, target_id, message)
+                elif parts[0] == "__key__":
+                    relay_key(client_id, parts[1] if len(parts) > 1 else "")
                 else:
                     broadcast(f"User {client_id}: {line}")
         else:
@@ -79,6 +81,34 @@ def send_private(from_id, to_id, message):
         sender_info["conn"].sendall((msg + "\n").encode())
     except Exception:
         remove_client(sender_info["conn"])
+
+
+def relay_key(from_id, key_data):
+    for info in clients.values():
+        if info["id"] == from_id:
+            info["key"] = key_data
+            break
+
+    msg = f"__key__ from {from_id}: {key_data}"
+    for info in clients.values():
+        if info["id"] != from_id:
+            try:
+                info["conn"].sendall((msg + "\n").encode())
+            except Exception:
+                pass
+
+    for info in clients.values():
+        if info["id"] == from_id:
+            sender_conn = info["conn"]
+            for existing in clients.values():
+                if existing["id"] != from_id and existing.get("key"):
+                    try:
+                        sender_conn.sendall(
+                            (f"__key__ from {existing['id']}: {existing['key']}\n").encode()
+                        )
+                    except Exception:
+                        pass
+            break
 
 
 def broadcast(msg):
